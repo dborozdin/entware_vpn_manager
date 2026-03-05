@@ -1,0 +1,79 @@
+#!/bin/sh
+# VPN Manager init script for Entware
+# Starts/stops the Web UI (vpn_manager.py) and Health Monitor (vpn_monitor.sh)
+
+DESC="VPN Manager"
+MANAGER_SCRIPT="/opt/etc/vpnmanager/vpn_manager.py"
+MONITOR_SCRIPT="/opt/etc/vpnmanager/vpn_monitor.sh"
+MANAGER_PID="/opt/var/run/vpnmanager.pid"
+MONITOR_PID="/opt/var/run/vpnmonitor.pid"
+PYTHON="/opt/bin/python3"
+PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+start() {
+    echo "Starting $DESC..."
+
+    # Start Web UI
+    if [ -f "$MANAGER_PID" ] && kill -0 "$(cat "$MANAGER_PID")" 2>/dev/null; then
+        echo "  Web UI already running (PID $(cat "$MANAGER_PID"))"
+    else
+        start-stop-daemon -S -b -m -p "$MANAGER_PID" \
+            -x "$PYTHON" -- "$MANAGER_SCRIPT"
+        echo "  Web UI started"
+    fi
+
+    # Start Monitor
+    if [ -f "$MONITOR_PID" ] && kill -0 "$(cat "$MONITOR_PID")" 2>/dev/null; then
+        echo "  Monitor already running (PID $(cat "$MONITOR_PID"))"
+    else
+        start-stop-daemon -S -b -m -p "$MONITOR_PID" \
+            -x /bin/sh -- "$MONITOR_SCRIPT"
+        echo "  Monitor started"
+    fi
+
+    echo "Done."
+}
+
+stop() {
+    echo "Stopping $DESC..."
+
+    if [ -f "$MANAGER_PID" ]; then
+        start-stop-daemon -K -p "$MANAGER_PID" 2>/dev/null
+        rm -f "$MANAGER_PID"
+        echo "  Web UI stopped"
+    fi
+
+    if [ -f "$MONITOR_PID" ]; then
+        start-stop-daemon -K -p "$MONITOR_PID" 2>/dev/null
+        rm -f "$MONITOR_PID"
+        # Also kill any child processes (python3 from monitor)
+        pkill -f "vpn_monitor.sh" 2>/dev/null
+        echo "  Monitor stopped"
+    fi
+
+    echo "Done."
+}
+
+status() {
+    echo "$DESC status:"
+    if [ -f "$MANAGER_PID" ] && kill -0 "$(cat "$MANAGER_PID")" 2>/dev/null; then
+        echo "  Web UI: running (PID $(cat "$MANAGER_PID"))"
+    else
+        echo "  Web UI: stopped"
+    fi
+    if [ -f "$MONITOR_PID" ] && kill -0 "$(cat "$MONITOR_PID")" 2>/dev/null; then
+        echo "  Monitor: running (PID $(cat "$MONITOR_PID"))"
+    else
+        echo "  Monitor: stopped"
+    fi
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *)       echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+
+exit 0

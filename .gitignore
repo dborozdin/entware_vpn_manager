@@ -1,0 +1,38 @@
+# Personal config (contains credentials, subscription URLs)
+deploy_vpn_manager.py
+ssh_login_passw.txt
+vless_params.txt
+
+# Test/exploration scripts (contain hardcoded credentials)
+test_proxy.py
+ssh_check.py
+ssh_exec.py
+install_deps.py
+upload_and_install.py
+check_status.py
+fetch_subscription.py
+explore_xray_setup.py
+explore_routing.py
+setup_xray_vless.py
+fix_xray.py
+switch_server.py
+monitrc_update.py
+
+# Data files with personal server info
+vless_servers.json
+subscription_decoded.txt
+ip-list.json
+ip-list.txt
+
+# Binary packages
+packages/
+Packages.gz
+*.ipk
+
+# Images
+*.png
+
+# IDE / tool config
+.claude/
+__pycache__/
+*.pyc

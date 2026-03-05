@@ -1,0 +1,305 @@
+"""Deploy VPN Manager to Keenetic router via SSH.
+
+Installs packages, deploys scripts, configures xray SOCKS inbound,
+updates monit, and starts services.
+
+Usage:
+    1. Copy this file to deploy_vpn_manager.py
+    2. Edit the configuration variables below
+    3. pip install paramiko
+    4. python deploy_vpn_manager.py
+"""
+
+import paramiko
+import json
+import base64
+import time
+import os
+
+# ===== EDIT THESE =====
+HOST = "192.168.1.1"        # Router IP
+PORT = 222                   # SSH port (22 or 222)
+USER = "root"                # SSH user
+PASSWD = "your_password"     # SSH password
+
+# Default subscription group (optional, leave empty to add via Web UI)
+DEFAULT_SUB_NAME = "myVPN"
+DEFAULT_SUB_URL = ""         # VLESS subscription URL (https://...)
+# =======================
+
+SOCKS_PORT = 10808
+MANAGER_PORT = 3000
+
+# Local file paths (same directory as this script)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def ssh_exec(client, cmd, timeout=30):
+    print(f">>> {cmd}")
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    if out.strip():
+        print(out.strip())
+    if err.strip():
+        print(f"STDERR: {err.strip()}")
+    rc = stdout.channel.recv_exit_status()
+    print(f"Exit code: {rc}\n")
+    return out, err, rc
+
+
+def write_remote_file(client, remote_path, content):
+    """Write file to router via SSH using base64 encoding."""
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    b64 = base64.b64encode(content).decode("ascii")
+    chunk_size = 4000
+    chunks = [b64[i:i + chunk_size] for i in range(0, len(b64), chunk_size)]
+    ssh_exec(client, f"echo -n '{chunks[0]}' > /tmp/_b64tmp")
+    for chunk in chunks[1:]:
+        ssh_exec(client, f"echo -n '{chunk}' >> /tmp/_b64tmp")
+    ssh_exec(client, f"base64 -d /tmp/_b64tmp > {remote_path} && rm /tmp/_b64tmp")
+    print(f"  -> Written {remote_path} ({len(content)} bytes)\n")
+
+
+def read_local_file(filename):
+    path = os.path.join(SCRIPT_DIR, filename)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def build_default_config():
+    return {
+        "subscription_groups": [
+            {
+                "name": DEFAULT_SUB_NAME,
+                "url": DEFAULT_SUB_URL,
+                "servers": [],
+                "last_fetched": "",
+            }
+        ] if DEFAULT_SUB_NAME and DEFAULT_SUB_URL else [],
+        "active_group": 0,
+        "active_server_index": 0,
+        "monitor": {
+            "enabled": True,
+            "check_interval": 60,
+            "fail_threshold": 3,
+            "hydra_restart_attempts": 2,
+            "check_url": "https://claude.ai",
+            "check_timeout": 10,
+            "socks_port": SOCKS_PORT,
+            "exclude_countries": [],
+        },
+        "services": {
+            "xray_config_path": "/opt/etc/xray/config.json",
+            "xray_init_script": "/opt/etc/init.d/S24xray",
+            "xray_proxy_port": 12345,
+            "socks_port": SOCKS_PORT,
+            "hydra_init_script": "",
+        },
+        "xray_config_path": "/opt/etc/xray/config.json",
+        "xray_init_script": "/opt/etc/init.d/S24xray",
+        "xray_proxy_port": 12345,
+    }
+
+
+def add_socks_inbound(client):
+    """Add SOCKS5 inbound to xray config if not already present."""
+    print("=== Checking xray SOCKS inbound ===")
+    out, _, _ = ssh_exec(client, "cat /opt/etc/xray/config.json")
+    try:
+        xray_cfg = json.loads(out)
+    except json.JSONDecodeError:
+        print("ERROR: Cannot parse xray config!")
+        return False
+
+    # Check if socks inbound already exists
+    for ib in xray_cfg.get("inbounds", []):
+        if ib.get("tag") == "socks-in" or ib.get("protocol") == "socks":
+            print("  SOCKS inbound already exists, skipping")
+            return True
+
+    # Add SOCKS inbound
+    socks_inbound = {
+        "tag": "socks-in",
+        "port": SOCKS_PORT,
+        "listen": "127.0.0.1",
+        "protocol": "socks",
+        "settings": {
+            "auth": "noauth",
+            "udp": False,
+        },
+    }
+    xray_cfg["inbounds"].append(socks_inbound)
+
+    config_json = json.dumps(xray_cfg, indent=2, ensure_ascii=False)
+    write_remote_file(client, "/opt/etc/xray/config.json", config_json)
+
+    # Validate
+    print("=== Validating xray config ===")
+    _, _, rc = ssh_exec(client, "xray run -test -config /opt/etc/xray/config.json 2>&1")
+    if rc != 0:
+        print("ERROR: Xray config validation failed after adding SOCKS inbound!")
+        return False
+
+    return True
+
+
+def update_monit(client):
+    """Add vpnmanager to monit config if not already present."""
+    print("=== Updating monit config ===")
+    out, _, _ = ssh_exec(client, "cat /opt/etc/monitrc 2>/dev/null")
+    if "vpnmanager" in out:
+        print("  vpnmanager already in monit config")
+        return
+
+    monit_block = """
+# === VPN Manager ===
+check process vpnmanager matching "vpn_manager.py"
+    start program = "/opt/etc/init.d/S25vpnmanager start"
+    stop program  = "/opt/etc/init.d/S25vpnmanager stop"
+    if failed host 127.0.0.1 port 3000 protocol http then restart
+    if 5 restarts within 10 cycles then unmonitor
+"""
+    # Append to monitrc
+    safe = monit_block.replace('"', '\\"').replace('$', '\\$')
+    for line in safe.strip().split("\n"):
+        ssh_exec(client, f'echo "{line}" >> /opt/etc/monitrc')
+
+    # Reload monit
+    ssh_exec(client, "/opt/bin/monit -c /opt/etc/monitrc reload 2>/dev/null || true")
+
+
+def main():
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    print(f"Connecting to {HOST}:{PORT}...")
+    client.connect(HOST, port=PORT, username=USER, password=PASSWD, timeout=10)
+    print("Connected!\n")
+
+    # Step 1: Install required packages
+    print("=" * 60)
+    print("STEP 1: Install packages")
+    print("=" * 60)
+    ssh_exec(client, "opkg update", timeout=60)
+    ssh_exec(client, "opkg install python3-light", timeout=120)
+    ssh_exec(client, "opkg install python3-openssl", timeout=60)
+    ssh_exec(client, "opkg install python3-email python3-logging python3-urllib python3-codecs", timeout=120)
+    ssh_exec(client, "opkg install curl", timeout=60)
+
+    # Verify python3
+    _, _, rc = ssh_exec(client, "python3 --version")
+    if rc != 0:
+        print("ERROR: python3 not available! Aborting.")
+        client.close()
+        return
+
+    # Step 2: Create directories
+    print("=" * 60)
+    print("STEP 2: Create directories")
+    print("=" * 60)
+    ssh_exec(client, "mkdir -p /opt/etc/vpnmanager")
+    ssh_exec(client, "mkdir -p /opt/var/run")
+    ssh_exec(client, "mkdir -p /opt/var/log")
+
+    # Step 3: Stop existing services if running
+    print("=" * 60)
+    print("STEP 3: Stop existing services")
+    print("=" * 60)
+    ssh_exec(client, "/opt/etc/init.d/S25vpnmanager stop 2>/dev/null || true")
+
+    # Step 4: Deploy vpn_manager.py
+    print("=" * 60)
+    print("STEP 4: Deploy vpn_manager.py")
+    print("=" * 60)
+    manager_code = read_local_file("vpn_manager.py")
+    write_remote_file(client, "/opt/etc/vpnmanager/vpn_manager.py", manager_code)
+
+    # Step 5: Deploy vpn_monitor.sh
+    print("=" * 60)
+    print("STEP 5: Deploy vpn_monitor.sh")
+    print("=" * 60)
+    monitor_code = read_local_file("vpn_monitor.sh")
+    write_remote_file(client, "/opt/etc/vpnmanager/vpn_monitor.sh", monitor_code)
+    ssh_exec(client, "chmod +x /opt/etc/vpnmanager/vpn_monitor.sh")
+
+    # Step 6: Deploy init script
+    print("=" * 60)
+    print("STEP 6: Deploy init script")
+    print("=" * 60)
+    init_script = read_local_file("S25vpnmanager")
+    write_remote_file(client, "/opt/etc/init.d/S25vpnmanager", init_script)
+    ssh_exec(client, "chmod +x /opt/etc/init.d/S25vpnmanager")
+
+    # Step 7: Write default config (only if not exists)
+    print("=" * 60)
+    print("STEP 7: Write config")
+    print("=" * 60)
+    _, _, rc = ssh_exec(client, "test -f /opt/etc/vpnmanager/config.json && echo exists")
+    if rc != 0:
+        config = build_default_config()
+        config_json = json.dumps(config, ensure_ascii=False, indent=2)
+        write_remote_file(client, "/opt/etc/vpnmanager/config.json", config_json)
+        print("  Default config written")
+    else:
+        print("  Config already exists, keeping it")
+
+    # Step 8: Add SOCKS5 inbound to xray
+    print("=" * 60)
+    print("STEP 8: Configure xray SOCKS inbound")
+    print("=" * 60)
+    if add_socks_inbound(client):
+        print("=== Restarting xray ===")
+        ssh_exec(client, "/opt/etc/init.d/S24xray restart")
+        time.sleep(3)
+        ssh_exec(client, "ps w | grep xray | grep -v grep")
+    else:
+        print("WARNING: Could not add SOCKS inbound to xray")
+
+    # Step 9: Start VPN Manager services
+    print("=" * 60)
+    print("STEP 9: Start services")
+    print("=" * 60)
+    ssh_exec(client, "/opt/etc/init.d/S25vpnmanager start")
+    time.sleep(3)
+
+    # Step 10: Verify
+    print("=" * 60)
+    print("STEP 10: Verify")
+    print("=" * 60)
+    ssh_exec(client, "ps w | grep -E 'vpn_manager|vpn_monitor' | grep -v grep")
+    ssh_exec(client, f"curl -s --max-time 5 http://127.0.0.1:{MANAGER_PORT}/api/status 2>&1 | head -5")
+
+    # Step 11: Fetch initial subscription (if configured)
+    if DEFAULT_SUB_URL:
+        print("=" * 60)
+        print("STEP 11: Fetch subscription")
+        print("=" * 60)
+        ssh_exec(
+            client,
+            f'curl -s --max-time 30 -X POST http://127.0.0.1:{MANAGER_PORT}/api/group/fetch '
+            f'-H "Content-Type: application/json" -d \'{{\"group\": 0}}\'',
+            timeout=60,
+        )
+
+    # Step 12: Update monit (optional)
+    print("=" * 60)
+    print("STEP 12: Update monit")
+    print("=" * 60)
+    update_monit(client)
+
+    client.close()
+
+    print("\n" + "=" * 60)
+    print("DEPLOYMENT COMPLETE!")
+    print("=" * 60)
+    print(f"  Web UI: http://{HOST}:{MANAGER_PORT}")
+    print(f"  SOCKS proxy (for monitor): 127.0.0.1:{SOCKS_PORT}")
+    print(f"  Monitor log: /opt/var/log/vpnmonitor.log")
+    print(f"  Config: /opt/etc/vpnmanager/config.json")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
