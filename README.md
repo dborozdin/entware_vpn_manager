@@ -42,9 +42,9 @@ Provides a dashboard to manage VLESS subscription groups, switch VPN servers, an
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Screenshots
+## Screenshot
 
-*(coming soon)*
+![VPN Manager Dashboard](screenshots/dashboard.png)
 
 ## Requirements
 

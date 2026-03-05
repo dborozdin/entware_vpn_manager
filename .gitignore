@@ -29,8 +29,9 @@ packages/
 Packages.gz
 *.ipk
 
-# Images
+# Images (except screenshots dir)
 *.png
+!screenshots/*.png
 
 # IDE / tool config
 .claude/
